@@ -37,14 +37,12 @@ PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
 WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
 
 REG_DEADLINE = (os.getenv("REG_DEADLINE") or "2025-12-25").strip()
-CAPACITY_27 = int(os.getenv("CAPACITY_27", "200") or "200")
-CAPACITY_28 = int(os.getenv("CAPACITY_28", "200") or "200")
 
 GSHEET_ID = (os.getenv("GSHEET_ID") or "").strip()
 GSHEET_TAB = (os.getenv("GSHEET_TAB") or "Sheet1").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
 
-# Basic validation (keep, but don't crash on Sheets at startup)
+# Basic validation
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 if not ADMIN_CHAT_ID:
@@ -162,23 +160,6 @@ def get_all_rows() -> List[List[str]]:
     ).execute()
     return resp.get("values", [])
 
-def count_assigned(day: int) -> int:
-    rows = get_all_rows()
-    c = 0
-    for r in rows:
-        if len(r) >= 9 and str(r[8]).strip() == str(day):
-            c += 1
-    return c
-
-def choose_day() -> int:
-    d27 = count_assigned(27)
-    d28 = count_assigned(28)
-    if d27 < CAPACITY_27:
-        return 27
-    if d28 < CAPACITY_28:
-        return 28
-    return 27 if d27 <= d28 else 28
-
 def upsert_registration_row(
     chat_id: int,
     user_id: int,
@@ -259,6 +240,44 @@ def mark_notified(chat_id: int):
             return
 
 # ---------------------------
+# NEW: Assign day by surname groups (A..O => 27, P..CH => 28)
+# ---------------------------
+def _extract_surname(fullname: str) -> str:
+    parts = [p for p in (fullname or "").strip().split() if p]
+    if not parts:
+        return ""
+    return parts[-1]  # surname as last token
+
+
+def assign_day_by_surname(fullname_for_grouping: str) -> int:
+    """
+    Groups:
+      A..O => 27
+      P..Z and CH => 28
+    Special: if surname starts with 'CH' => 28
+    """
+    surname = _extract_surname(fullname_for_grouping)
+    s = (surname or "").strip().upper()
+
+    # normalize punctuation
+    s = s.replace("’", "").replace("'", "").replace("-", "")
+
+    if not s:
+        return 27
+
+    if s.startswith("CH"):
+        return 28
+
+    first = s[0]
+
+    if "A" <= first <= "O":
+        return 27
+    if "P" <= first <= "Z":
+        return 28
+
+    return 27
+
+# ---------------------------
 # Telegram handlers
 # ---------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,11 +343,17 @@ async def parent_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PARENT_PHONE
 
     context.user_data["parent_phone"] = phone
+
+    # ✅ assign day by surname (parent fullname recommended)
+    assigned_day = assign_day_by_surname(context.user_data["parent_fullname"])
+    context.user_data["assigned_day"] = assigned_day
+
     await update.message.reply_text(
         "✅ *Tekshiring:*\n\n"
         f"👧🧒 Farzand: *{context.user_data['child_fullname']}*\n"
         f"👤 Ota-ona: *{context.user_data['parent_fullname']}*\n"
-        f"📞 Telefon: *{context.user_data['parent_phone']}*\n\n"
+        f"📞 Telefon: *{context.user_data['parent_phone']}*\n"
+        f"🧸 Guruh: *{assigned_day}-dekabr*\n\n"
         "Tasdiqlash uchun: *Ha* (yozing)\nBekor qilish: *Yo‘q*",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -364,14 +389,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     chat_id = update.effective_chat.id
-
-    assigned_day = 27
-    try:
-        assigned_day = choose_day()
-    except Exception as e:
-        # if Sheets temporarily fails, still allow registration but default day
-        print("choose_day failed:", e)
-        assigned_day = 27
+    assigned_day = int(context.user_data.get("assigned_day", 27))
 
     # Write to Sheets (try, but don't crash)
     try:
@@ -401,6 +419,9 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✨ *Ro‘yxatdan o‘tganingiz uchun rahmat!*\n\n"
+        "🧸 *Guruhlar bo‘yicha tashrif tartibi:*\n"
+        "- A dan O gacha bo‘lgan familiyalar — 27-dekabr\n"
+        "- P dan CH gacha bo‘lgan familiyalar — 28-dekabr\n\n"
         "📩 Ro‘yxat yopilgach, kelish sanangiz bo‘yicha xabarnoma yuboriladi.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -450,8 +471,9 @@ async def export_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Bu buyruq faqat admin uchun.")
         return
     try:
-        c27 = count_assigned(27)
-        c28 = count_assigned(28)
+        rows = get_all_rows()
+        c27 = sum(1 for r in rows if len(r) >= 9 and str(r[8]).strip() == "27")
+        c28 = sum(1 for r in rows if len(r) >= 9 and str(r[8]).strip() == "28")
         await update.message.reply_text(f"📊 Assigned:\n27-dekabr: {c27}\n28-dekabr: {c28}")
     except Exception as e:
         await update.message.reply_text(f"Sheets xatolik: {e}")
