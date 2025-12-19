@@ -275,7 +275,7 @@ def _extract_surname(fullname: str) -> str:
     parts = [p for p in (fullname or "").strip().split() if p]
     if not parts:
         return ""
-    return parts[-1]  # surname = last word
+    return parts[0]  # surname = first word
 def assign_day_by_surname(fullname_for_grouping: str) -> int:
     """
     Uzbek (lotin) familiya bo‘yicha:
@@ -389,8 +389,7 @@ async def send_to_admin(context: ContextTypes.DEFAULT_TYPE, user, payload: Dict[
         "🆕 *Yangi ro‘yxatdan o‘tish*\n\n"
         f"👧🧒 Farzand: *{payload['child_fullname']}*\n"
         f"👤 Ota-ona: *{payload['parent_fullname']}*\n"
-        f"📞 Telefon: *{payload['parent_phone']}*\n"
-        f"📅 Taqsimlangan kun: *{payload['assigned_day']}-dekabr*\n\n"
+        f"📞 Telefon: *{payload['parent_phone']}*\n\n"
         f"👤 Username: @{user.username if user.username else '—'}\n"
         f"🆔 user_id: `{user.id}`\n"
         f"💬 chat_id: `{payload['chat_id']}`\n"
@@ -402,7 +401,6 @@ async def send_to_admin(context: ContextTypes.DEFAULT_TYPE, user, payload: Dict[
         caption=caption,
         parse_mode=ParseMode.MARKDOWN,
     )
-
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = (update.message.text or "").strip().lower()
     if ans in {"yo‘q", "yoq", "no", "cancel"}:
