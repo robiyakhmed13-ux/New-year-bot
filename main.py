@@ -23,6 +23,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+
 # ---------------------------
 # Load env
 # ---------------------------
@@ -32,19 +33,21 @@ TZ = ZoneInfo("Asia/Tashkent")
 PHONE_RE = re.compile(r"^\+?\d[\d\s()-]{7,}$")
 
 TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")  # admin CHAT id (not user id)
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
 WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
 
 REG_DEADLINE = (os.getenv("REG_DEADLINE") or "2025-12-25").strip()
-CAPACITY_27 = int(os.getenv("CAPACITY_27", "200") or "200")
-CAPACITY_28 = int(os.getenv("CAPACITY_28", "200") or "200")
 
 GSHEET_ID = (os.getenv("GSHEET_ID") or "").strip()
 GSHEET_TAB = (os.getenv("GSHEET_TAB") or "Sheet1").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
 
-# Basic validation (keep, but don't crash on Sheets at startup)
+# Normalize PUBLIC_URL (many people paste without https://)
+if PUBLIC_URL and not PUBLIC_URL.startswith(("http://", "https://")):
+    PUBLIC_URL = "https://" + PUBLIC_URL
+
+# Basic validation
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 if not ADMIN_CHAT_ID:
@@ -98,6 +101,46 @@ NOTIF_28 = (
     "Iltimos, belgilangan vaqtda yetib kelishingizni so‘raymiz.\n"
     "Farzandlaringiz uchun unutilmas Yangi yil bayrami tayyorlab qo‘yilgan! 🎅🎁"
 )
+
+GROUP_RULE = (
+    "🧸 *Guruhlar bo‘yicha tashrif tartibi:*\n"
+    "- A dan O gacha bo‘lgan familiyalar — 27-dekabr\n"
+    "- P dan CH gacha bo‘lgan familiyalar — 28-dekabr"
+)
+
+# ---------------------------
+# ✅ Assign day by surname (Uzbek Latin)
+# ---------------------------
+def _extract_surname(fullname: str) -> str:
+    parts = [p for p in (fullname or "").strip().split() if p]
+    return parts[-1] if parts else ""
+
+def assign_day_by_surname(fullname_for_grouping: str) -> int:
+    """
+    Familiya bo‘yicha:
+    - A..O  -> 27-dekabr
+    - P..CH -> 28-dekabr
+    Eslatma: CH doim 28.
+    """
+    surname = _extract_surname(fullname_for_grouping)
+    s = (surname or "").strip().upper()
+
+    # normalize apostrophes, hyphens
+    s = s.replace("’", "").replace("'", "").replace("-", "").replace("`", "")
+
+    if not s:
+        return 27
+
+    if s.startswith("CH"):
+        return 28
+
+    first = s[0]
+    if "A" <= first <= "O":
+        return 27
+    if "P" <= first <= "Z":
+        return 28
+    return 27
+
 
 # ---------------------------
 # Google Sheets helpers
@@ -162,23 +205,6 @@ def get_all_rows() -> List[List[str]]:
     ).execute()
     return resp.get("values", [])
 
-def count_assigned(day: int) -> int:
-    rows = get_all_rows()
-    c = 0
-    for r in rows:
-        if len(r) >= 9 and str(r[8]).strip() == str(day):
-            c += 1
-    return c
-
-def choose_day() -> int:
-    d27 = count_assigned(27)
-    d28 = count_assigned(28)
-    if d27 < CAPACITY_27:
-        return 27
-    if d28 < CAPACITY_28:
-        return 28
-    return 27 if d27 <= d28 else 28
-
 def upsert_registration_row(
     chat_id: int,
     user_id: int,
@@ -227,17 +253,23 @@ def upsert_registration_row(
         ).execute()
 
 def get_chat_ids_to_notify(day: int) -> List[int]:
+    """
+    ✅ IMPORTANT FIX:
+    Google Sheets often returns rows WITHOUT the last empty columns.
+    If notified_at (J) is empty, the row might have only 9 columns.
+    """
     rows = get_all_rows()
     out: List[int] = []
+
     for r in rows:
-        # need chat_id, parent_fullname, notified_at
-        if len(r) < 10:
+        if len(r) < 6:  # need chat_id and parent_fullname
             continue
 
         chat_id_str = str(r[1]).strip()
-        parent_fullname = str(r[5]).strip()  # parent_fullname column
-        notified = str(r[9]).strip()
+        parent_fullname = str(r[5]).strip()
 
+        # if J is missing => treat as not notified
+        notified = str(r[9]).strip() if len(r) >= 10 else ""
         if notified != "":
             continue
 
@@ -251,6 +283,7 @@ def get_chat_ids_to_notify(day: int) -> List[int]:
             continue
 
     return out
+
 def mark_notified(chat_id: int):
     global SHEETS
     if SHEETS is None:
@@ -268,45 +301,6 @@ def mark_notified(chat_id: int):
             ).execute()
             return
 
-# ---------------------------
-# ✅ ADDED (minimal): Assign day by surname
-# ---------------------------
-def _extract_surname(fullname: str) -> str:
-    parts = [p for p in (fullname or "").strip().split() if p]
-    if not parts:
-        return ""
-    return parts[0]  # surname = first word
-def assign_day_by_surname(fullname_for_grouping: str) -> int:
-    """
-    Uzbek (lotin) familiya bo‘yicha:
-    - A dan O gacha  -> 27-dekabr
-    - P dan CH gacha -> 28-dekabr
-    Eslatma: CH (digraph) har doim 28.
-    """
-    surname = _extract_surname(fullname_for_grouping)
-    s = (surname or "").strip().upper()
-    s = s.replace("’", "").replace("'", "").replace("-", "")
-
-    if not s:
-        return 27
-
-    # Special Uzbek digraphs
-    if s.startswith("CH"):
-        return 28
-
-    # Uzbek letters like O‘, G‘ start with O / G anyway after cleaning above
-    first = s[0]
-
-    # A..O => 27
-    if "A" <= first <= "O":
-        return 27
-
-    # P..Z => 28
-    if "P" <= first <= "Z":
-        return 28
-
-    return 27
-27
 
 # ---------------------------
 # Telegram handlers
@@ -385,11 +379,13 @@ async def parent_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CONFIRM
 
 async def send_to_admin(context: ContextTypes.DEFAULT_TYPE, user, payload: Dict[str, Any]):
+    # ✅ removed “Taqsimlangan kun” from admin text too (you said you don’t need it)
     caption = (
         "🆕 *Yangi ro‘yxatdan o‘tish*\n\n"
         f"👧🧒 Farzand: *{payload['child_fullname']}*\n"
         f"👤 Ota-ona: *{payload['parent_fullname']}*\n"
         f"📞 Telefon: *{payload['parent_phone']}*\n\n"
+        f"{GROUP_RULE}\n\n"
         f"👤 Username: @{user.username if user.username else '—'}\n"
         f"🆔 user_id: `{user.id}`\n"
         f"💬 chat_id: `{payload['chat_id']}`\n"
@@ -401,6 +397,7 @@ async def send_to_admin(context: ContextTypes.DEFAULT_TYPE, user, payload: Dict[
         caption=caption,
         parse_mode=ParseMode.MARKDOWN,
     )
+
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = (update.message.text or "").strip().lower()
     if ans in {"yo‘q", "yoq", "no", "cancel"}:
@@ -413,7 +410,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # ✅ ONLY CHANGE: assign day by surname rule (NOT capacity)
+    # ✅ group day is determined by parent surname
     assigned_day = assign_day_by_surname(context.user_data.get("parent_fullname", ""))
 
     # Write to Sheets (try, but don't crash)
@@ -426,7 +423,7 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parent_fullname=context.user_data["parent_fullname"],
             parent_phone=context.user_data["parent_phone"],
             photo_file_id=context.user_data["photo_file_id"],
-            assigned_day=assigned_day,
+            assigned_day=assigned_day,  # kept for audit, but not shown in messages
         )
     except Exception as e:
         print("Sheets upsert failed:", e)
@@ -444,19 +441,22 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✨ *Ro‘yxatdan o‘tganingiz uchun rahmat!*\n\n"
-        "🧸 *Guruhlar bo‘yicha tashrif tartibi:*\n"
-        "- A dan O gacha bo‘lgan familiyalar — 27-dekabr\n"
-        "- P dan CH gacha bo‘lgan familiyalar — 28-dekabr\n\n"
+        f"{GROUP_RULE}\n\n"
         "📩 Ro‘yxat yopilgach, kelish sanangiz bo‘yicha xabarnoma yuboriladi.",
         parse_mode=ParseMode.MARKDOWN,
     )
     return ConversationHandler.END
 
+
 # ---------------------------
 # Admin push commands
 # ---------------------------
+def is_admin_chat(update: Update) -> bool:
+    # ✅ ADMIN_CHAT_ID is a CHAT id. Check against chat.id, not user.id.
+    return update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID
+
 async def notify_day(update: Update, context: ContextTypes.DEFAULT_TYPE, day: int):
-    if update.effective_user.id != ADMIN_CHAT_ID:
+    if not is_admin_chat(update):
         await update.message.reply_text("Bu buyruq faqat admin uchun.")
         return
 
@@ -492,15 +492,28 @@ async def notify28(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await notify_day(update, context, 28)
 
 async def export_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_CHAT_ID:
+    if not is_admin_chat(update):
         await update.message.reply_text("Bu buyruq faqat admin uchun.")
         return
+
+    # counts are computed from surname logic on-the-fly (no dependency on stored assigned_day)
     try:
-        c27 = count_assigned(27)
-        c28 = count_assigned(28)
-        await update.message.reply_text(f"📊 Assigned:\n27-dekabr: {c27}\n28-dekabr: {c28}")
+        rows = get_all_rows()
+        c27 = 0
+        c28 = 0
+        for r in rows:
+            if len(r) < 6:
+                continue
+            parent_fullname = str(r[5]).strip()
+            d = assign_day_by_surname(parent_fullname)
+            if d == 27:
+                c27 += 1
+            else:
+                c28 += 1
+        await update.message.reply_text(f"📊 Guruhlar:\n27-dekabr (A–O): {c27}\n28-dekabr (P–CH): {c28}")
     except Exception as e:
         await update.message.reply_text(f"Sheets xatolik: {e}")
+
 
 # ---------------------------
 # FastAPI + PTB wiring
@@ -531,17 +544,16 @@ def setup_handlers():
 
 @api.on_event("startup")
 async def on_startup():
-    # ✅ 1) handlers first
     setup_handlers()
 
-    # ✅ 2) initialize PTB (required for v21+)
+    # PTB v21+ requires initialize()
     await ptb_app.initialize()
     await ptb_app.start()
 
-    # ✅ 3) set webhook
+    # set webhook
     await ptb_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
 
-    # ✅ 4) Sheets setup should NEVER block app start
+    # Sheets setup should never block app start
     try:
         ensure_headers()
     except HttpError as e:
