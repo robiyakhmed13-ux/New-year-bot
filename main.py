@@ -230,17 +230,27 @@ def get_chat_ids_to_notify(day: int) -> List[int]:
     rows = get_all_rows()
     out: List[int] = []
     for r in rows:
-        if len(r) < 9:
+        # need chat_id, parent_fullname, notified_at
+        if len(r) < 10:
             continue
-        assigned = str(r[8]).strip()
-        notified = str(r[9]).strip() if len(r) >= 10 else ""
-        if assigned == str(day) and notified == "":
-            try:
-                out.append(int(str(r[1]).strip()))
-            except Exception:
-                continue
-    return out
 
+        chat_id_str = str(r[1]).strip()
+        parent_fullname = str(r[5]).strip()  # parent_fullname column
+        notified = str(r[9]).strip()
+
+        if notified != "":
+            continue
+
+        computed_day = assign_day_by_surname(parent_fullname)
+        if computed_day != day:
+            continue
+
+        try:
+            out.append(int(chat_id_str))
+        except Exception:
+            continue
+
+    return out
 def mark_notified(chat_id: int):
     global SHEETS
     if SHEETS is None:
@@ -266,12 +276,12 @@ def _extract_surname(fullname: str) -> str:
     if not parts:
         return ""
     return parts[-1]  # surname = last word
-
 def assign_day_by_surname(fullname_for_grouping: str) -> int:
     """
-    A..O => 27-dekabr
-    P..CH => 28-dekabr
-    Special: CH => 28
+    Uzbek (lotin) familiya bo‘yicha:
+    - A dan O gacha  -> 27-dekabr
+    - P dan CH gacha -> 28-dekabr
+    Eslatma: CH (digraph) har doim 28.
     """
     surname = _extract_surname(fullname_for_grouping)
     s = (surname or "").strip().upper()
@@ -279,16 +289,24 @@ def assign_day_by_surname(fullname_for_grouping: str) -> int:
 
     if not s:
         return 27
+
+    # Special Uzbek digraphs
     if s.startswith("CH"):
         return 28
 
+    # Uzbek letters like O‘, G‘ start with O / G anyway after cleaning above
     first = s[0]
+
+    # A..O => 27
     if "A" <= first <= "O":
         return 27
+
+    # P..Z => 28
     if "P" <= first <= "Z":
         return 28
 
     return 27
+27
 
 # ---------------------------
 # Telegram handlers
