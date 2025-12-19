@@ -3,7 +3,7 @@ import re
 import json
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -21,25 +21,30 @@ from telegram.ext import (
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
+# ---------------------------
+# Load env
+# ---------------------------
 load_dotenv()
 
 TZ = ZoneInfo("Asia/Tashkent")
 PHONE_RE = re.compile(r"^\+?\d[\d\s()-]{7,}$")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
 
-REG_DEADLINE = os.getenv("REG_DEADLINE", "2025-12-25").strip()
+REG_DEADLINE = (os.getenv("REG_DEADLINE") or "2025-12-25").strip()
 CAPACITY_27 = int(os.getenv("CAPACITY_27", "200") or "200")
 CAPACITY_28 = int(os.getenv("CAPACITY_28", "200") or "200")
 
-GSHEET_ID = os.getenv("GSHEET_ID", "").strip()
-GSHEET_TAB = os.getenv("GSHEET_TAB", "Sheet1").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GSHEET_ID = (os.getenv("GSHEET_ID") or "").strip()
+GSHEET_TAB = (os.getenv("GSHEET_TAB") or "Sheet1").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
 
+# Basic validation (keep, but don't crash on Sheets at startup)
 if not TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 if not ADMIN_CHAT_ID:
@@ -56,7 +61,9 @@ if not GOOGLE_SERVICE_ACCOUNT_JSON:
 WEBHOOK_PATH = f"/telegram/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{PUBLIC_URL}{WEBHOOK_PATH}"
 
+# ---------------------------
 # Conversation states
+# ---------------------------
 CHILD_FULLNAME, PARENT_FULLNAME, CHILD_PHOTO, PARENT_PHONE, CONFIRM = range(5)
 
 WELCOME = (
@@ -92,9 +99,10 @@ NOTIF_28 = (
     "Farzandlaringiz uchun unutilmas Yangi yil bayrami tayyorlab qo‘yilgan! 🎅🎁"
 )
 
-# -----------------------
+# ---------------------------
 # Google Sheets helpers
-# -----------------------
+# ---------------------------
+SHEETS = None  # init later
 
 def _sheets_service():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -103,8 +111,6 @@ def _sheets_service():
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-SHEETS = _sheets_service()
 
 def tab_range(a1: str) -> str:
     return f"{GSHEET_TAB}!{a1}"
@@ -118,11 +124,19 @@ def deadline_passed() -> bool:
     return datetime.now(TZ).date() > dl
 
 def ensure_headers():
-    # If first row empty, write headers
+    """
+    Creates header row if missing.
+    IMPORTANT: Called in try/except on startup so it never kills the app.
+    """
+    global SHEETS
+    if SHEETS is None:
+        SHEETS = _sheets_service()
+
     resp = SHEETS.spreadsheets().values().get(
         spreadsheetId=GSHEET_ID, range=tab_range("A1:J1")
     ).execute()
     vals = resp.get("values", [])
+
     if vals and len(vals[0]) >= 3:
         return
 
@@ -139,6 +153,10 @@ def ensure_headers():
     ).execute()
 
 def get_all_rows() -> List[List[str]]:
+    global SHEETS
+    if SHEETS is None:
+        SHEETS = _sheets_service()
+
     resp = SHEETS.spreadsheets().values().get(
         spreadsheetId=GSHEET_ID, range=tab_range("A2:J")
     ).execute()
@@ -148,7 +166,6 @@ def count_assigned(day: int) -> int:
     rows = get_all_rows()
     c = 0
     for r in rows:
-        # assigned_day is column I (index 8) in A..J
         if len(r) >= 9 and str(r[8]).strip() == str(day):
             c += 1
     return c
@@ -175,8 +192,11 @@ def upsert_registration_row(
     """
     If chat_id exists, update that row; else append new row.
     """
-    rows = get_all_rows()
+    global SHEETS
+    if SHEETS is None:
+        SHEETS = _sheets_service()
 
+    rows = get_all_rows()
     target_row_index = None  # 0-based in rows (A2=0)
     for idx, r in enumerate(rows):
         if len(r) >= 2 and str(r[1]).strip() == str(chat_id):
@@ -190,7 +210,6 @@ def upsert_registration_row(
     ]]
 
     if target_row_index is None:
-        # append
         SHEETS.spreadsheets().values().append(
             spreadsheetId=GSHEET_ID,
             range=tab_range("A2:J"),
@@ -199,7 +218,6 @@ def upsert_registration_row(
             body={"values": values},
         ).execute()
     else:
-        # update exact row (row number in sheet = 2 + idx)
         row_num = 2 + target_row_index
         SHEETS.spreadsheets().values().update(
             spreadsheetId=GSHEET_ID,
@@ -209,13 +227,9 @@ def upsert_registration_row(
         ).execute()
 
 def get_chat_ids_to_notify(day: int) -> List[int]:
-    """
-    Return chat_ids where assigned_day==day and notified_at empty.
-    """
     rows = get_all_rows()
-    out = []
+    out: List[int] = []
     for r in rows:
-        # columns: A..J => 0..9
         if len(r) < 9:
             continue
         assigned = str(r[8]).strip()
@@ -228,11 +242,14 @@ def get_chat_ids_to_notify(day: int) -> List[int]:
     return out
 
 def mark_notified(chat_id: int):
+    global SHEETS
+    if SHEETS is None:
+        SHEETS = _sheets_service()
+
     rows = get_all_rows()
     for idx, r in enumerate(rows):
         if len(r) >= 2 and str(r[1]).strip() == str(chat_id):
             row_num = 2 + idx
-            # write notified_at in column J
             SHEETS.spreadsheets().values().update(
                 spreadsheetId=GSHEET_ID,
                 range=tab_range(f"J{row_num}"),
@@ -241,30 +258,9 @@ def mark_notified(chat_id: int):
             ).execute()
             return
 
-# -----------------------
+# ---------------------------
 # Telegram handlers
-# -----------------------
-
-async def send_to_admin(context: ContextTypes.DEFAULT_TYPE, user, payload: Dict[str, Any]):
-    caption = (
-        "🆕 *Yangi ro‘yxatdan o‘tish*\n\n"
-        f"👧🧒 Farzand: *{payload['child_fullname']}*\n"
-        f"👤 Ota-ona: *{payload['parent_fullname']}*\n"
-        f"📞 Telefon: *{payload['parent_phone']}*\n"
-        f"📅 Taqsimlangan kun: *{payload['assigned_day']}-dekabr*\n\n"
-        f"👤 Username: @{user.username if user.username else '—'}\n"
-        f"🆔 user_id: `{user.id}`\n"
-        f"💬 chat_id: `{payload['chat_id']}`\n"
-        f"🕒 Vaqt: {now_str()}"
-    )
-    # ✅ PHOTO goes to admin
-    await context.bot.send_photo(
-        chat_id=ADMIN_CHAT_ID,
-        photo=payload["photo_file_id"],
-        caption=caption,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
+# ---------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME, parse_mode=ParseMode.MARKDOWN)
 
@@ -328,7 +324,6 @@ async def parent_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PARENT_PHONE
 
     context.user_data["parent_phone"] = phone
-
     await update.message.reply_text(
         "✅ *Tekshiring:*\n\n"
         f"👧🧒 Farzand: *{context.user_data['child_fullname']}*\n"
@@ -338,6 +333,25 @@ async def parent_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN,
     )
     return CONFIRM
+
+async def send_to_admin(context: ContextTypes.DEFAULT_TYPE, user, payload: Dict[str, Any]):
+    caption = (
+        "🆕 *Yangi ro‘yxatdan o‘tish*\n\n"
+        f"👧🧒 Farzand: *{payload['child_fullname']}*\n"
+        f"👤 Ota-ona: *{payload['parent_fullname']}*\n"
+        f"📞 Telefon: *{payload['parent_phone']}*\n"
+        f"📅 Taqsimlangan kun: *{payload['assigned_day']}-dekabr*\n\n"
+        f"👤 Username: @{user.username if user.username else '—'}\n"
+        f"🆔 user_id: `{user.id}`\n"
+        f"💬 chat_id: `{payload['chat_id']}`\n"
+        f"🕒 Vaqt: {now_str()}"
+    )
+    await context.bot.send_photo(
+        chat_id=ADMIN_CHAT_ID,
+        photo=payload["photo_file_id"],
+        caption=caption,
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = (update.message.text or "").strip().lower()
@@ -351,21 +365,30 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    assigned_day = choose_day()
+    assigned_day = 27
+    try:
+        assigned_day = choose_day()
+    except Exception as e:
+        # if Sheets temporarily fails, still allow registration but default day
+        print("choose_day failed:", e)
+        assigned_day = 27
 
-    # Save to Google Sheets (stateless + auditable)
-    upsert_registration_row(
-        chat_id=chat_id,
-        user_id=user.id,
-        username=user.username or "",
-        child_fullname=context.user_data["child_fullname"],
-        parent_fullname=context.user_data["parent_fullname"],
-        parent_phone=context.user_data["parent_phone"],
-        photo_file_id=context.user_data["photo_file_id"],
-        assigned_day=assigned_day,
-    )
+    # Write to Sheets (try, but don't crash)
+    try:
+        upsert_registration_row(
+            chat_id=chat_id,
+            user_id=user.id,
+            username=user.username or "",
+            child_fullname=context.user_data["child_fullname"],
+            parent_fullname=context.user_data["parent_fullname"],
+            parent_phone=context.user_data["parent_phone"],
+            photo_file_id=context.user_data["photo_file_id"],
+            assigned_day=assigned_day,
+        )
+    except Exception as e:
+        print("Sheets upsert failed:", e)
 
-    # Send photo + all info to admin
+    # Always send to admin (with photo)
     payload = {
         "chat_id": chat_id,
         "child_fullname": context.user_data["child_fullname"],
@@ -383,19 +406,20 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# -----------------------
+# ---------------------------
 # Admin push commands
-# -----------------------
-
-def is_admin(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id == ADMIN_CHAT_ID
-
+# ---------------------------
 async def notify_day(update: Update, context: ContextTypes.DEFAULT_TYPE, day: int):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await update.message.reply_text("Bu buyruq faqat admin uchun.")
         return
 
-    chat_ids = get_chat_ids_to_notify(day)
+    try:
+        chat_ids = get_chat_ids_to_notify(day)
+    except Exception as e:
+        await update.message.reply_text(f"Sheets xatolik: {e}")
+        return
+
     if not chat_ids:
         await update.message.reply_text(f"{day}-dekabr uchun yuboriladigan (yangi) ro‘yxat yo‘q.")
         return
@@ -405,7 +429,10 @@ async def notify_day(update: Update, context: ContextTypes.DEFAULT_TYPE, day: in
     for cid in chat_ids:
         try:
             await context.bot.send_message(chat_id=cid, text=msg, parse_mode=ParseMode.MARKDOWN)
-            mark_notified(cid)
+            try:
+                mark_notified(cid)
+            except Exception:
+                pass
             sent += 1
         except Exception:
             failed += 1
@@ -422,14 +449,16 @@ async def export_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID:
         await update.message.reply_text("Bu buyruq faqat admin uchun.")
         return
-    c27 = count_assigned(27)
-    c28 = count_assigned(28)
-    await update.message.reply_text(f"📊 Assigned:\n27-dekabr: {c27}\n28-dekabr: {c28}")
+    try:
+        c27 = count_assigned(27)
+        c28 = count_assigned(28)
+        await update.message.reply_text(f"📊 Assigned:\n27-dekabr: {c27}\n28-dekabr: {c28}")
+    except Exception as e:
+        await update.message.reply_text(f"Sheets xatolik: {e}")
 
-# -----------------------
+# ---------------------------
 # FastAPI + PTB wiring
-# -----------------------
-
+# ---------------------------
 api = FastAPI(title="CBU NY Bot (Sheets + Push)")
 ptb_app = Application.builder().token(TOKEN).build()
 
@@ -456,9 +485,32 @@ def setup_handlers():
 
 @api.on_event("startup")
 async def on_startup():
-    ensure_headers()
+    # ✅ 1) handlers first
     setup_handlers()
+
+    # ✅ 2) initialize PTB (required for v21+)
+    await ptb_app.initialize()
+    await ptb_app.start()
+
+    # ✅ 3) set webhook
     await ptb_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+
+    # ✅ 4) Sheets setup should NEVER block app start
+    try:
+        ensure_headers()
+    except HttpError as e:
+        print("⚠️ Sheets HttpError:", e)
+    except Exception as e:
+        print("⚠️ Sheets ensure_headers failed:", e)
+
+@api.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await ptb_app.bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+    await ptb_app.stop()
+    await ptb_app.shutdown()
 
 @api.get("/")
 async def root():
